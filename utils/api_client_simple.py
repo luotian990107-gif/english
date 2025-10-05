@@ -22,6 +22,7 @@ class SimpleAPIClient:
         """调用chat completions API"""
         url = f"{self.api_base}/chat/completions"
         
+        # 构建请求数据
         data = {
             "model": model or OPENAI_MODEL,
             "messages": messages,
@@ -32,30 +33,83 @@ class SimpleAPIClient:
         
         try:
             if stream:
-                # 流式响应
+                # 流式响应处理
+                data["stream"] = True
                 response = requests.post(url, headers=self.headers, json=data, stream=True, timeout=60)
                 response.raise_for_status()
                 
-                for line in response.iter_lines():
-                    if line:
-                        line = line.decode('utf-8')
-                        if line.startswith('data: '):
-                            line = line[6:]  # 移除 "data: " 前缀
-                            if line == '[DONE]':
-                                break
-                            try:
-                                chunk = json.loads(line)
-                                if chunk.get('choices') and len(chunk['choices']) > 0:
-                                    delta = chunk['choices'][0].get('delta', {})
-                                    if delta.get('content'):
-                                        yield delta['content']
-                            except json.JSONDecodeError:
-                                continue
+                # 返回生成器
+                def stream_generator():
+                    for line in response.iter_lines():
+                        if line:
+                            line = line.decode('utf-8')
+                            if line.startswith('data: '):
+                                line = line[6:]  # 移除 "data: " 前缀
+                                if line == '[DONE]':
+                                    break
+                                try:
+                                    chunk = json.loads(line)
+                                    if chunk.get('choices') and len(chunk['choices']) > 0:
+                                        delta = chunk['choices'][0].get('delta', {})
+                                        if delta.get('content'):
+                                            yield delta['content']
+                                except json.JSONDecodeError:
+                                    continue
+                
+                # 返回生成器函数的调用结果
+                return stream_generator()
+                
             else:
-                # 非流式响应
+                # 非流式响应 - 确保返回字典
+                data["stream"] = False
                 response = requests.post(url, headers=self.headers, json=data, timeout=60)
                 response.raise_for_status()
-                return response.json()
+                
+                # 获取响应文本
+                response_text = response.text
+                
+                # 尝试解析JSON
+                try:
+                    result = json.loads(response_text)
+                except json.JSONDecodeError:
+                    # 如果不是JSON，可能是流式响应格式
+                    # 尝试提取内容
+                    lines = response_text.strip().split('\n')
+                    content_parts = []
+                    
+                    for line in lines:
+                        if line.startswith('data: '):
+                            try:
+                                chunk_data = json.loads(line[6:])
+                                if chunk_data.get('choices') and len(chunk_data['choices']) > 0:
+                                    # 对于流式格式，尝试提取delta或message内容
+                                    choice = chunk_data['choices'][0]
+                                    if 'delta' in choice and 'content' in choice['delta']:
+                                        content_parts.append(choice['delta']['content'])
+                                    elif 'message' in choice and 'content' in choice['message']:
+                                        content_parts.append(choice['message']['content'])
+                            except:
+                                continue
+                    
+                    # 如果成功提取了内容，构造标准响应格式
+                    if content_parts:
+                        result = {
+                            'choices': [{
+                                'message': {
+                                    'content': ''.join(content_parts),
+                                    'role': 'assistant'
+                                },
+                                'finish_reason': 'stop'
+                            }]
+                        }
+                    else:
+                        raise Exception(f"无法解析API响应: {response_text[:500]}")
+                
+                # 确保返回的是字典格式
+                if not isinstance(result, dict):
+                    raise Exception(f"API返回了非预期的格式: {type(result)}")
+                    
+                return result
                 
         except requests.exceptions.RequestException as e:
             raise Exception(f"API请求失败: {str(e)}")
@@ -127,11 +181,30 @@ def get_claude_response(prompt: str, system_prompt: str) -> str:
             )
             
             # 检查响应是否有效
-            if response and response.get('choices') and len(response['choices']) > 0:
-                # 返回生成的文本
-                return response['choices'][0]['message']['content']
+            if response:
+                # 确保是字典响应
+                if not isinstance(response, dict):
+                    st.error(f"❌ API返回了非预期的格式: {type(response)}")
+                    return None
+                    
+                # 检查是否有选择项
+                if response.get('choices') and len(response['choices']) > 0:
+                    # 获取消息内容
+                    choice = response['choices'][0]
+                    if 'message' in choice and 'content' in choice['message']:
+                        return choice['message']['content']
+                    else:
+                        st.error(f"❌ 响应格式不正确: {choice}")
+                        return None
+                else:
+                    # 检查是否有错误信息
+                    if 'error' in response:
+                        st.error(f"❌ API错误: {response['error']}")
+                    else:
+                        st.error(f"❌ API返回了空响应: {response}")
+                    return None
             else:
-                st.error("❌ API返回了空响应，请稍后再试")
+                st.error("❌ 未收到API响应")
                 return None
             
     except Exception as e:
@@ -193,14 +266,22 @@ def get_streaming_response(prompt: str, system_prompt: str):
         
         # 调用API获取流式响应
         client = st.session_state.client
-        for chunk in client.chat_completion(
+        response = client.chat_completion(
             messages=messages,
             model=model,
             max_tokens=MAX_TOKENS,
             temperature=TEMPERATURE,
             stream=True
-        ):
-            yield chunk
+        )
+        
+        # 检查返回值是否为生成器
+        if hasattr(response, '__iter__') and not isinstance(response, (str, dict)):
+            # 是生成器，直接迭代
+            for chunk in response:
+                yield chunk
+        else:
+            # 不是生成器，可能是错误或其他格式
+            yield f"❌ 意外的响应格式: {type(response)}"
                 
     except Exception as e:
         error_msg = str(e)
